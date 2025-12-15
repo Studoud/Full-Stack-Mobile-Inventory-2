@@ -34,15 +34,12 @@ export const AddProductScreen: React.FC = () => {
       showErrorAlert('Le nom est obligatoire');
       return;
     }
-    
     const priceNumber = parseFloat(price);
     if (isNaN(priceNumber) || priceNumber <= 0) {
       showErrorAlert('Le prix doit être un nombre positif');
       return;
     }
-
-    setLoading(true);
-    
+    setLoading(true); 
     try {
       // Appel à l'API pour ajouter le produit
       await productAPI.create({

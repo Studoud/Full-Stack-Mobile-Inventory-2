@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -8,6 +8,7 @@ import {
   StyleSheet,
   TextInput,
   Modal,
+  RefreshControl,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { StackNavigationProp } from '@react-navigation/stack';
@@ -18,106 +19,163 @@ import { Product } from '../types';
 
 type ProductListScreenNavigationProp = StackNavigationProp<RootStackParamList, 'ProductList'>;
 
+// --- UTILS : Formatage du prix ---
+const formatPrice = (price: number | string): string => {
+  const num = typeof price === 'string' ? parseFloat(price) : price;
+  if (isNaN(num)) return 'N/A';
+  return num.toFixed(2);
+};
+// ----------------------------------
+
 export const ProductListScreen: React.FC = () => {
   const navigation = useNavigation<ProductListScreenNavigationProp>();
   
+  // États
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   
-  // États pour la modal de modification
+  // États modal
   const [modalVisible, setModalVisible] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [editName, setEditName] = useState('');
   const [editPrice, setEditPrice] = useState('');
   const [editDescription, setEditDescription] = useState('');
-  const [updating, setUpdating] = useState(false);
 
-  // Charger les produits au démarrage
-  useEffect(() => {
-    loadProducts();
-  }, []);
+  const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Charger les produits (et mettre fin au chargement/refresh)
   const loadProducts = async () => {
     try {
       const data = await productAPI.getAll();
       setProducts(data);
     } catch (error) {
       console.error('Erreur de chargement:', error);
+      showErrorAlert('Erreur de chargement des produits');
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   };
 
-  // Fonction pour ouvrir la modal de modification
+  useEffect(() => {
+    loadProducts();
+  }, []);
+
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    // Recharge complète et effacement de la recherche en cas de pull-to-refresh
+    setSearchQuery(''); 
+    loadProducts();
+  }, []);
+
+  // Recherche API
+  const performSearch = async (query: string) => {
+    try {
+      setLoading(true); // Indiquer qu'une recherche est en cours
+      const data = await productAPI.search(query);
+      setProducts(data);
+    } catch (error) {
+      console.error('Erreur de recherche:', error);
+      showErrorAlert('Erreur lors de la recherche.');
+    } finally {
+        setLoading(false);
+    }
+  };
+  
+  // Recherche optimisée (Debounce)
+  const handleSearch = (text: string) => {
+    setSearchQuery(text);
+    
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+    }
+    
+    searchTimeoutRef.current = setTimeout(() => {
+      if (text.trim() === '') {
+        loadProducts();
+      } else {
+        performSearch(text);
+      }
+    }, 300);
+  };
+
+  // Effacer recherche
+  const clearSearch = () => {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+    }
+    setSearchQuery('');
+    loadProducts();
+  };
+
+  // Modifier produit
   const handleEditProduct = (product: Product) => {
     setEditingProduct(product);
     setEditName(product.name);
-    setEditPrice(product.price.toString());
+    // S'assurer que le prix est affiché comme une chaîne
+    setEditPrice(String(product.price)); 
     setEditDescription(product.description || '');
     setModalVisible(true);
   };
-
-  // Fonction pour sauvegarder les modifications
+  // Sauvegarder modifications
   const handleSaveEdit = async () => {
     if (!editingProduct) return;
-
-    // Validation
     if (!editName.trim()) {
       showErrorAlert('Le nom est obligatoire');
       return;
     }
-    
-    const priceNumber = parseFloat(editPrice);
+    // : S'assurer que le prix est un nombre valide (gère la virgule/point)
+    const priceNumber = Number(editPrice.replace(',', '.')); 
     if (isNaN(priceNumber) || priceNumber <= 0) {
-      showErrorAlert('Le prix doit être un nombre positif');
+      showErrorAlert('Le prix doit être un nombre positif valide');
       return;
     }
-
-    setUpdating(true);
     try {
       await productAPI.update(editingProduct.id, {
         name: editName.trim(),
         price: priceNumber,
         description: editDescription.trim(),
       });
-
-      // Mettre à jour la liste locale
-      setProducts(products.map(p => 
+      // Mise à jour optimisée locale
+      setProducts(prev => prev.map(p => 
         p.id === editingProduct.id 
           ? { ...p, name: editName, price: priceNumber, description: editDescription }
           : p
       ));
-
-      showSuccessAlert('Produit modifié avec succès !');
+      showSuccessAlert('Produit modifié !');
       setModalVisible(false);
     } catch (error) {
+      console.error('Erreur lors de la modification:', error);
       showErrorAlert('Erreur lors de la modification');
-    } finally {
-      setUpdating(false);
     }
   };
 
+  // Supprimer produit
   const handleDeleteProduct = (id: number, name: string) => {
     showConfirmAlert(
       'Supprimer',
-      `Voulez-vous supprimer "${name}" ?`,
+      `Supprimer "${name}" ?`,
       async () => {
         try {
           await productAPI.delete(id);
-          setProducts(products.filter(p => p.id !== id));
+          setProducts(prev => prev.filter(p => p.id !== id));
           showSuccessAlert('Produit supprimé');
         } catch (error) {
-          console.error('Erreur de suppression:', error);
+          showErrorAlert('Erreur lors de la suppression');
         }
       }
     );
   };
 
+  // Naviguer vers ajout
   const goToAddProduct = () => {
     navigation.navigate('AddProduct');
   };
 
-  if (loading) {
+  // Écran de chargement
+  if (loading && products.length === 0 && !refreshing) { // Vérifier loading initial
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#4a6cff" />
@@ -126,9 +184,63 @@ export const ProductListScreen: React.FC = () => {
     );
   }
 
+  // Render un produit
+  const renderProduct = ({ item }: { item: Product }) => (
+    <View style={styles.productCard}>
+      <View style={styles.productInfo}>
+        <Text style={styles.productName}>{item.name}</Text>
+        <Text style={styles.productPrice}>
+          {formatPrice(item.price)} € {/* Utilisation du formatage universel */}
+        </Text>
+        {item.description && (
+          <Text style={styles.productDescription} numberOfLines={2}>
+            {item.description}
+          </Text>
+        )}
+      </View>
+      
+      <View style={styles.actionButtons}>
+        <TouchableOpacity
+          style={styles.editButton}
+          onPress={() => handleEditProduct(item)}
+        >
+          <Text style={styles.editText}>✏️</Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity
+          style={styles.deleteButton}
+          onPress={() => handleDeleteProduct(item.id, item.name)}
+        >
+          <Text style={styles.deleteText}>🗑️</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
+  // Écran vide
+  const renderEmpty = () => (
+    <View style={styles.emptyContainer}>
+      {searchQuery ? (
+        <>
+          <Text style={styles.emptyText}>Aucun produit pour "{searchQuery}"</Text>
+          <TouchableOpacity style={styles.emptyButton} onPress={clearSearch}>
+            <Text style={styles.emptyButtonText}>Voir tous</Text>
+          </TouchableOpacity>
+        </>
+      ) : (
+        <>
+          <Text style={styles.emptyText}>Aucun produit</Text>
+          <TouchableOpacity style={styles.emptyButton} onPress={goToAddProduct}>
+            <Text style={styles.emptyButtonText}>Ajouter</Text>
+          </TouchableOpacity>
+        </>
+      )}
+    </View>
+  );
+
   return (
     <View style={styles.container}>
-      {/* En-tête */}
+      {/* Header fixe */}
       <View style={styles.header}>
         <Text style={styles.title}>📋 Liste des Produits</Text>
         <TouchableOpacity style={styles.addButton} onPress={goToAddProduct}>
@@ -136,59 +248,48 @@ export const ProductListScreen: React.FC = () => {
         </TouchableOpacity>
       </View>
 
+      {/* Recherche */}
+      <View style={styles.searchContainer}>
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Rechercher..."
+          value={searchQuery}
+          onChangeText={handleSearch}
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity style={styles.clearButton} onPress={clearSearch}>
+            <Text style={styles.clearButtonText}>✕</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {/* Compteur (utilise 'products' car il contient déjà les résultats de la recherche API) */}
       <Text style={styles.count}>
         {products.length} produit{products.length !== 1 ? 's' : ''}
+        {searchQuery ? ` (recherche)` : ''}
       </Text>
 
-      {/* Liste des produits */}
+      {/* FlatList pour la liste */}
       <FlatList
-        data={products}
+        data={products} // Utilise directement 'products' après la simplification de la recherche
+        renderItem={renderProduct}
         keyExtractor={(item) => item.id.toString()}
-        renderItem={({ item }) => (
-          <View style={styles.productCard}>
-            <View style={styles.productInfo}>
-              <Text style={styles.productName}>{item.name}</Text>
-              <Text style={styles.productPrice}>
-                {typeof item.price === 'number' 
-                  ? item.price.toFixed(2) 
-                  : parseFloat(item.price as string).toFixed(2)} €
-              </Text>
-              {item.description && (
-                <Text style={styles.productDescription}>{item.description}</Text>
-              )}
-            </View>
-            
-            {/* BOUTONS D'ACTION */}
-            <View style={styles.actionButtons}>
-              {/* Bouton Modifier */}
-              <TouchableOpacity
-                style={styles.editButton}
-                onPress={() => handleEditProduct(item)}
-              >
-                <Text style={styles.editText}>✏️</Text>
-              </TouchableOpacity>
-              
-              {/* Bouton Supprimer */}
-              <TouchableOpacity
-                style={styles.deleteButton}
-                onPress={() => handleDeleteProduct(item.id, item.name)}
-              >
-                <Text style={styles.deleteText}>🗑️</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        )}
-        ListEmptyComponent={
-          <View style={styles.emptyContainer}>
-            <Text style={styles.emptyText}>Aucun produit</Text>
-            <TouchableOpacity style={styles.emptyButton} onPress={loadProducts}>
-              <Text style={styles.emptyButtonText}>Actualiser</Text>
-            </TouchableOpacity>
-          </View>
+        ListEmptyComponent={renderEmpty}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            colors={['#4a6cff']}
+          />
         }
+        contentContainerStyle={styles.listContent}
+        showsVerticalScrollIndicator={true}
+        initialNumToRender={10} 
+        maxToRenderPerBatch={5} 
+        windowSize={5} 
       />
 
-      {/* MODAL DE MODIFICATION */}
+      {/* Modal de modification (inchangé, c'est l'origine du blocage de scroll si actif) */}
       <Modal
         animationType="slide"
         transparent={true}
@@ -197,17 +298,15 @@ export const ProductListScreen: React.FC = () => {
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>✏️ Modifier le produit</Text>
+            <Text style={styles.modalTitle}>✏️ Modifier produit</Text>
             
-            <Text style={styles.label}>Nom *</Text>
             <TextInput
               style={styles.modalInput}
               value={editName}
               onChangeText={setEditName}
-              placeholder="Nom du produit"
+              placeholder="Nom"
             />
             
-            <Text style={styles.label}>Prix *</Text>
             <TextInput
               style={styles.modalInput}
               value={editPrice}
@@ -216,7 +315,6 @@ export const ProductListScreen: React.FC = () => {
               placeholder="Prix"
             />
             
-            <Text style={styles.label}>Description</Text>
             <TextInput
               style={[styles.modalInput, styles.modalTextArea]}
               value={editDescription}
@@ -229,7 +327,6 @@ export const ProductListScreen: React.FC = () => {
               <TouchableOpacity
                 style={[styles.modalButton, styles.cancelButton]}
                 onPress={() => setModalVisible(false)}
-                disabled={updating}
               >
                 <Text style={styles.cancelButtonText}>Annuler</Text>
               </TouchableOpacity>
@@ -237,13 +334,8 @@ export const ProductListScreen: React.FC = () => {
               <TouchableOpacity
                 style={[styles.modalButton, styles.saveButton]}
                 onPress={handleSaveEdit}
-                disabled={updating}
               >
-                {updating ? (
-                  <ActivityIndicator color="white" size="small" />
-                ) : (
-                  <Text style={styles.saveButtonText}>Sauvegarder</Text>
-                )}
+                <Text style={styles.saveButtonText}>Sauvegarder</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -253,11 +345,12 @@ export const ProductListScreen: React.FC = () => {
   );
 };
 
+// Styles (inchangés, ils sont très corrects)
 const styles = StyleSheet.create({
+  // ... (tous les styles d'origine)
   container: {
     flex: 1,
     backgroundColor: '#f5f5f5',
-    padding: 20,
   },
   loadingContainer: {
     flex: 1,
@@ -273,106 +366,158 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 15,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: 'white',
+    borderBottomWidth: 1,
+    borderBottomColor: '#eee',
   },
   title: {
-    fontSize: 24,
+    fontSize: 20,
     fontWeight: 'bold',
     color: '#333',
   },
   addButton: {
     backgroundColor: '#28a745',
-    padding: 10,
-    borderRadius: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 6,
   },
   addButtonText: {
     color: 'white',
     fontWeight: '600',
+    fontSize: 14,
+  },
+  searchContainer: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: 'white',
+  },
+  searchInput: {
+    backgroundColor: '#f8f9fa',
+    borderWidth: 1,
+    borderColor: '#dee2e6',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+    paddingRight: 40,
+  },
+  clearButton: {
+    position: 'absolute',
+    right: 24,
+    top: 22,
+    backgroundColor: '#ced4da',
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  clearButtonText: {
+    fontSize: 12,
+    color: '#495057',
+    fontWeight: 'bold',
   },
   count: {
-    fontSize: 16,
-    color: '#666',
-    marginBottom: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    backgroundColor: 'white',
+    fontSize: 14,
+    color: '#6c757d',
+    fontStyle: 'italic',
+    borderBottomWidth: 1,
+    borderBottomColor: '#eee',
+  },
+  listContent: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    paddingBottom: 20,
+    flexGrow: 1, // Important pour le scroll si la liste est vide
   },
   productCard: {
     backgroundColor: 'white',
-    padding: 15,
+    padding: 12,
     borderRadius: 8,
-    marginBottom: 10,
+    marginBottom: 8,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-    elevation: 2,
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
   },
   productInfo: {
     flex: 1,
+    marginRight: 12,
   },
   productName: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#333',
-    marginBottom: 5,
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#212529',
+    marginBottom: 4,
   },
   productPrice: {
-    fontSize: 16,
+    fontSize: 15,
     color: '#28a745',
     fontWeight: '600',
-    marginBottom: 5,
+    marginBottom: 4,
   },
   productDescription: {
-    fontSize: 14,
-    color: '#666',
+    fontSize: 13,
+    color: '#6c757d',
+    lineHeight: 18,
   },
-  // NOUVEAU : Conteneur pour les boutons
   actionButtons: {
     flexDirection: 'row',
-    alignItems: 'center',
   },
-  // Bouton Modifier
   editButton: {
     backgroundColor: '#4a6cff',
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     justifyContent: 'center',
     alignItems: 'center',
-    marginRight: 8,
+    marginRight: 6,
   },
   editText: {
-    fontSize: 18,
+    fontSize: 16,
   },
-  // Bouton Supprimer (modifié)
   deleteButton: {
     backgroundColor: '#ff6b6b',
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     justifyContent: 'center',
     alignItems: 'center',
   },
   deleteText: {
-    fontSize: 18,
+    fontSize: 16,
   },
   emptyContainer: {
     alignItems: 'center',
-    padding: 40,
+    paddingVertical: 60,
+    paddingHorizontal: 20,
   },
   emptyText: {
-    fontSize: 18,
-    color: '#666',
-    marginBottom: 20,
+    fontSize: 16,
+    color: '#6c757d',
+    marginBottom: 16,
+    textAlign: 'center',
   },
   emptyButton: {
     backgroundColor: '#4a6cff',
-    padding: 10,
-    borderRadius: 5,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 6,
   },
   emptyButtonText: {
     color: 'white',
     fontWeight: '600',
+    fontSize: 14,
   },
-  // STYLES POUR LA MODAL
   modalOverlay: {
     flex: 1,
     justifyContent: 'center',
@@ -381,32 +526,27 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     backgroundColor: 'white',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 20,
     width: '90%',
     maxWidth: 400,
   },
   modalTitle: {
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: 'bold',
-    color: '#333',
-    marginBottom: 20,
+    color: '#212529',
+    marginBottom: 16,
     textAlign: 'center',
   },
-  label: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#555',
-    marginBottom: 5,
-  },
   modalInput: {
-    backgroundColor: '#f9f9f9',
+    backgroundColor: '#f8f9fa',
     borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 5,
-    padding: 10,
+    borderColor: '#dee2e6',
+    borderRadius: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
     fontSize: 16,
-    marginBottom: 15,
+    marginBottom: 12,
   },
   modalTextArea: {
     height: 80,
@@ -415,28 +555,29 @@ const styles = StyleSheet.create({
   modalButtons: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginTop: 10,
+    marginTop: 16,
   },
   modalButton: {
     flex: 1,
-    padding: 12,
-    borderRadius: 5,
-    alignItems: 'center',
+    paddingVertical: 10,
+    borderRadius: 6,
   },
   cancelButton: {
-    backgroundColor: '#ccc',
-    marginRight: 10,
+    backgroundColor: '#e9ecef',
+    marginRight: 8,
   },
   saveButton: {
     backgroundColor: '#28a745',
-    marginLeft: 10,
+    marginLeft: 8,
   },
   cancelButtonText: {
-    color: '#333',
+    color: '#495057',
     fontWeight: '600',
+    fontSize: 14,
   },
   saveButtonText: {
     color: 'white',
-    fontWeight: 'bold',
+    fontWeight: '600',
+    fontSize: 14,
   },
 });
